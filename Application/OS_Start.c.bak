@@ -1,0 +1,316 @@
+#include "defines.h"
+#include "IP_init.h"
+
+const U8 st1[]= "       Проверка системы";
+const U8 st2[]= "Тест EEPROM       ... ";
+const U8 st3[]= "Тест SD карты     ... ";
+const U8 st4[]= "Тест панели       ... ";
+const U8 st5[]= "Тест RTC          ... ";
+const U8 st6[]= "Тест конфигурации ... ";
+const U8 st7[]= " загружены заводские установки!";
+const U8 st8[]= "пройден";
+const U8 st9[]= "ошибка!";
+const U8 st10[]= "   Есть критические ошибки";
+const U8 st11[]= "дальнейшая работа невозможна!";
+const U8 st12[]= "Требуется заменить батарейку RTC";
+const U8 st13[]= "     Загрузите конфигурацию!    ";
+const U8 st14[]= " Идёт загрузка конфигурации ... ";
+
+OS_TASK                           TP80;                           // Task-control-block
+OS_TASK                           TP502;
+OS_TASK                           TCP_CMD; 
+OS_TASK                           OS_TFT;
+OS_TASK                           OS_USB;
+OS_TASK                           OS_SUPERVISER;
+OS_TASK                           OS_MASTER;
+OS_TASK                           OS_UARTS; 
+
+/* Semafores */
+OS_RSEMA                          SemaRAM;
+OS_RSEMA                          SemaSPI1;
+OS_RSEMA                          SemaSPI3;
+OS_RSEMA                          SemaTCP;
+OS_RSEMA                          SemaTFT;
+
+/* mail boxes */
+OS_MAILBOX                        TouchPad_MB;
+OS_MAILBOX                        Key_MB;
+
+/* таймера */
+OS_TIMER                          OneSecTimer;
+OS_TIMER                          SDTimer;
+OS_TIMER                          PumpTimer;
+OS_TIMER                          TFTTimer;
+
+
+static OS_STACKPTR U32            IP80Stack[320-64];                 // Define the stack of the IP80_Task 
+static OS_STACKPTR U32            IP502Stack[192];                // Define the stack of the IP502_Task
+static OS_STACKPTR U32            TCPCMDStack[192];               // Define the stack of the CMD_Task
+OS_STACKPTR U32            StackTFT[256+64+64];                  // Define the stack of the OS_TFT
+static OS_STACKPTR U32            StackUSB[128];                  // Define the stack of the USB_Task
+static OS_STACKPTR U32            StackSUPERVISER[128];
+static OS_STACKPTR U32            StackMASTER[128];
+static OS_STACKPTR U32            StackUARTS[128]; 
+
+int main(void) {
+  OS_IncDI();                      /* Initially disable interrupts  */
+  OS_InitKern();                   /* initialize OS                 */
+  
+  OS_CREATERSEMA(&SemaRAM);         // create RAM semafor
+  OS_CREATERSEMA(&SemaSPI1);        // create SPI1 semafor
+  OS_CREATERSEMA(&SemaSPI3);        // create SPI3 semafor
+  OS_CREATERSEMA(&SemaTCP);
+  
+  OS_InitHW();                     /* initialize Hardware for OS    */
+  
+  OS_CREATEMB( &TouchPad_MB, 4, 1, &MBTouchPadKeyBuffer);
+  OS_CREATEMB( &Key_MB, 1, 1, &MBKeyBuffer);
+  
+  OS_CreateTimer( &OneSecTimer,  oneSecISR, 1000);
+  OS_CreateTimer( &SDTimer,     SDTimerISR, 100);
+  OS_CreateTimer( &PumpTimer,      PumpISR, 1000);
+  OS_CreateTimer( &TFTTimer,        TFTISR, 60000);
+  
+  OS_CREATETASK(&OS_SUPERVISER, 0, Superviser_Task, 50, StackSUPERVISER); 
+     
+  /* Start multitasking */
+  OS_Start();
+  return 0;
+}
+
+Int32U RTC_GetCounter(void)
+{
+  Int32U counter;
+  Int16U tmp;
+
+  do
+  {
+    tmp = RTC_CNTH;
+    counter = (((uint32_t)tmp << 16 ) | RTC_CNTL);
+  } while(tmp != RTC_CNTH);
+  return counter;
+}
+
+void RTC_SetCounter (U32 newtime)
+{
+  PWR_CR_bit.DBP=       1;
+  while(!RTC_CRL_bit.RTOFF);
+  RTC_CRL_bit.CNF=      1;
+  while(!RTC_CRL_bit.RTOFF);
+  RTC_CNTL=             0;
+  while(!RTC_CRL_bit.RTOFF);
+  RTC_CNTH=             newtime >> 16;
+  while(!RTC_CRL_bit.RTOFF);
+  RTC_CNTL=             newtime & 0xffff;    
+  while(!RTC_CRL_bit.RTOFF);
+  RTC_CRL_bit.CNF=      0;
+  while(!RTC_CRL_bit.RTOFF);
+  PWR_CR_bit.DBP=       0;
+}
+void  Superviser_Task(void)
+{
+  U32             startLoopTime;    
+  U32             superviserWaitTime = 50;  
+  char            message;
+  char            st[50];
+    
+  /* проверка памяти конфигурации, загрузка конфигурации, проверка конфигурации */
+  LoadAndCheckConfig( );
+    
+  /* проверка наличия SD карты и перевод её в SPI режим */
+  errors_flags.sd_not_present =  sd_check( ); 
+  if(!errors_flags.sd_not_present) errors_flags.sd_fail = sd_initialization( );
+  
+  /* запуск коммуникаций */
+  OS_CREATETASK(&OS_UARTS,      0, UARTS_Task,      50, StackUARTS); 
+  OS_CREATETASK(&OS_USB,        0, USB_Task,        50, StackUSB);  
+  
+  /* start Ethernet */
+  if(ConfigWord & TCP_PRESENT) 
+  {
+    OS_Eth_init(0);
+    OS_CREATETASK(&TP80, 0, IP80_Task    , 50, IP80Stack);                                      // Start the port80_Task
+    OS_CREATETASK(&TP502, 0, IP502_Task  , 50, IP502Stack);                                     // Start the port502_Task    
+    OS_CREATETASK(&TCP_CMD, 0, UDP_Task  , 50, TCPCMDStack);                                    // Start the port502_Task            
+  }
+  
+//  if (strstr ((char const *)DeviceName, "-С-")==0)//TFT
+#ifndef LED
+//  {
+  /* инициализация TFT */
+  errors_flags.tft_fail  =  TFT_init( );
+  
+  if(errors_flags.tft_fail)
+  {
+    // вечный стоп по поводу дохлого индикатора
+    set_sound(R_SOUND_1000_2000);
+    GPIOE_ODR= 0x5555;
+    GPIOE_CRL= 0x88888888;
+    GPIOE_CRH= 0x88888888;
+    
+    GPIOD_ODR= (GPIOD_ODR & 0xff) | 0x55;
+    GPIOD_CRL= 0x84a28888;
+    
+    for(;;CLEAR_IWDG) 
+    {
+      OS_Delay(1000);
+      
+      GPIOE_ODR =  ~GPIOE_ODR;
+      GPIOD_ODR =  (GPIOD_ODR ^ 0xff) & ~BIT4;
+    }
+  }
+      
+  // цвет и вкус
+  TFT_String.fColor   =   WHITE;
+  TFT_String.bColor   =   BLACK;
+  TFT_String.Y        =   0;
+
+#ifdef TFT32
+  TFT_String.fontType =  &Tahoma19B; 
+#else
+  TFT_String.fontType =  &Tahoma34;
+#endif
+    
+  /* терминальный вывод состояния по настроийке или при ошибках */  
+  {        
+    TFT_WriteStringT((pU8)st1); TFT_WriteStringT(""); OS_Delay(250); 
+      sprintf(st,"%s%s", st2, errors_flags.config_memory_fail ? st9 : st8); TFT_WriteStringT((pU8)st); OS_Delay(250); 
+        sprintf(st,"%s%s", st3, (errors_flags.sd_fail || errors_flags.sd_not_present) ? st9 : st8); TFT_WriteStringT((pU8)st); OS_Delay(250); 
+          sprintf(st,"%s%s", st4, errors_flags.touch_error ? st9 : st8); TFT_WriteStringT((pU8)st); OS_Delay(250); 
+            sprintf(st,"%s%s", st5, errors_flags.timeinvalid ? st9 : st8); TFT_WriteStringT((pU8)st); OS_Delay(250); 
+              sprintf(st,"%s%s", st6, errors_flags.config_fail ? st9 : st8); TFT_WriteStringT((pU8)st); OS_Delay(250); 
+  }
+    
+  /* критические ошибки */
+  if( errors_flags.config_memory_fail || errors_flags.touch_error || errors_flags.sd_fail || errors_flags.sd_not_present)
+  {
+    TFT_WriteStringT(""); 
+    TFT_WriteStringT((pU8)st10); 
+    TFT_WriteStringT((pU8)st11); 
+    set_sound(S_SOUND_500);  
+    for(;;CLEAR_IWDG) OS_Delay(1000);
+    /* cnjznm? vehrf */
+  }
+     
+  /* скажи конфигурации "нет!" */
+  if(errors_flags.config_fail)
+  {
+    TFT_WriteStringT("");
+    TFT_WriteStringT((pU8)st13);
+    set_sound(S_SOUND_500);
+    
+    while((ConfigWord & CONFIG_MASK) != (~InvConfigWord & CONFIG_MASK)) 
+    {
+      OS_Delay(1000);
+      CLEAR_IWDG;
+    }
+    
+    set_sound(S_SOUND_500);
+    OS_Delay(1000);
+    HW_RESET;     
+  }
+  
+  /* дохлая батарейка */
+  if(errors_flags.timeinvalid)
+  {
+    TFT_WriteStringT("");
+    TFT_WriteStringT((pU8)st12);
+    set_sound(S_SOUND_500);
+    for(U32 i = 0; i < 3; i++, CLEAR_IWDG) OS_Delay(1000);
+  }
+  //}//TFT
+#endif
+  
+ /* запустить задачи */
+  OS_CREATETASK(&OS_MASTER, "MASTER Task", MASTER_Task, 50, StackMASTER);  
+  
+#ifndef LED
+  OS_CREATETASK(&OS_TFT, "TFT Task", TFT_Task, 50, StackTFT);
+#else
+  led_init ();
+#endif
+  OS_STARTTIMER_IF_NOT( &OneSecTimer);
+  
+  U8 usbBugClock = 0;       
+  for(;;CLEAR_IWDG)
+  {
+    /*  */
+    OS_Delay(superviserWaitTime);
+    startLoopTime = OS_GetTime32();
+    
+    /* скан тач панели */
+#ifndef LED
+    scan_touch();
+#endif    
+    
+    /* AUX keys */
+    scan_key();
+        
+    /*  установить реле и ток */
+    set_relay_ang();
+                
+    /* вызов процедур управления и статистики */
+    message = OS_ClearEvents(NULL);
+    {
+      if(message & 1)
+      {
+        ControlManager();
+        ConfigDeal();
+        SoundDeal();
+        if(ConfigWord & TCP_PRESENT)
+        {
+          if(WebServerConfig.Disabled)  { OS_SUSPEND_IF_NOT( &TP80 ); }
+          else                          { OS_RESUME_IF_NOT ( &TP80 ); }
+        }
+        //Time = ((U32)RTC_CNTH << 16) + RTC_CNTL;  // время для внешнего обзора
+        Time=RTC_GetCounter ();
+                
+        if( IS_USB_CONNECT && !USB_IsConfigured() )  
+        {
+          usbBugClock++;
+          if( usbBugClock == 10 ) 
+          {
+            GPIOA_CRH &= 0xffffff0f;
+            GPIOA_CRH |= 0x00000020;
+          }
+        }
+        else                                          
+        {
+          usbBugClock = 0;
+          if( (GPIOA_CRH & 0x000000f0) == 0x00000020 ) 
+          {
+            GPIOA_CRH &= 0xffffff0f;
+            GPIOA_CRH |= 0x00000040;
+          }
+        }
+      }
+    
+      if(message & 2) StatisticManager();
+    }
+
+    /*                  */
+    startLoopTime = OS_GetTime32() - startLoopTime; 
+    if(startLoopTime < 50)  superviserWaitTime = 50 - startLoopTime; 
+    else                    superviserWaitTime = 0;
+  }
+}
+
+/* статистика */
+void  StatisticManager(void)
+{
+  if (errors_flags.sd_fail) return;
+  
+  OS_Use( &SemaRAM);
+  {
+     errors_flags.sd_fail = errors_flags.sd_fail || write_SDCard( (pU8)MainArray, WriteStatAddr, 0x600);
+     WriteStatAddr       += 0x600;
+     if(WriteStatAddr >= (SD_STATISTIC_SIZE + SD_STATISTIC_OFFSET))
+     {
+        WriteStatAddr     = SD_STATISTIC_OFFSET;
+        ConfigWord       |= STATISCTIC_OVERFLOW;
+        SAVE_CONFIG( ConfigWord);
+     }
+     SAVE_CONFIG( WriteStatAddr);
+  }
+  OS_Unuse( &SemaRAM);
+}

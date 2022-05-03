@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<workspace>
+    <project>
+        <path>$WS_DIR$\..\..\Service\Booter_STM32F20x40x\STM32F20x_booter.ewp</path>
+    </project>
+    <project>
+        <path>$WS_DIR$\tft-3251.ewp</path>
+    </project>
+    <batchBuild />
+</workspace>

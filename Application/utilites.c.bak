@@ -1,0 +1,1707 @@
+#include "defines.h"
+#include "IP_init.h"
+
+#define WDATA_POINTER             &buf[6]
+#define RDATA_POINTER             &buf[2]
+#define ASK_USBANS                buf[0]
+#define BYTENUM_USB               buf[1]
+
+#define PUT_CHK_NUM_ASK(A)       { U16 i; ASK_USBANS = ASK_USBEXCH; for (BYTENUM_USB = (A), i = 0, buf[2+(A)] = 0xff; i < (A)+2; i++) buf[(A)+2] += buf[i]; }
+#define PUT_CHK_NUM_NAK(A)       { U16 i; ASK_USBANS = NAK_USBEXCH; for (BYTENUM_USB = (A), i = 0, buf[2+(A)] = 0xff; i < (A)+2; i++) buf[(A)+2] += buf[i]; }
+
+typedef struct
+{       /* result of int divide */
+  int quot;
+  int rem;
+} udiv_t;
+
+/* байт по спаю передать/принять */
+#pragma optimize=none
+U8  shift_byte_spi1(U8 byte)
+{
+  SPI1_DR= byte; 
+  while(!SPI1_SR_bit.TXE); 
+  while(SPI1_SR_bit.BSY); 
+  return SPI1_DR; 
+}
+
+/* байт по спаю передать/принять */
+#pragma optimize=none
+U8  shift_byte_spi3(U8 byte)
+{
+  SPI3_DR= byte; 
+  while(!SPI3_SR_bit.TXE); 
+  while(SPI3_SR_bit.BSY); 
+  return SPI3_DR; 
+}
+
+// ################################################# SPI1 -  управление платой реле, тока, коммутатром ###################################################
+/*  установить коммутатор */
+void  SetComInputLine(U8 adr)
+{ 
+  OS_Use( &SemaSPI1 );
+  shift_byte_spi1(adr);
+  LOAD_CMT;
+  OS_Unuse( &SemaSPI1 );
+}
+
+/*  установить аналоговый выход */
+void  SetCurrentDac(U16 Dac1, U8 currentChanel)
+{   
+  OS_Use(&SemaSPI1);
+  if(currentChanel < 8) currentChanel |= 0x10;  // разруливаем между двумя платами
+    
+  // выкл все каналы
+  shift_byte_spi1( 0x18 );
+  LOAD_ANG;
+  
+  // грузим ЦАП
+  DAC_DHR12R1= Dac1; 
+  
+  // включаем текущий канал
+  shift_byte_spi1( currentChanel );
+  LOAD_ANG; 
+  OS_Unuse(&SemaSPI1);
+}
+
+/*  установить реле */
+void  SetRelay(U16 relayword)
+{ 
+  OS_Use(&SemaSPI1);
+  shift_byte_spi1(relayword >> 8);
+  shift_byte_spi1(relayword);
+  LOAD_RLY;  
+  OS_Unuse(&SemaSPI1);
+}
+
+/* обновление состояния реле и аналогового выхода */
+void  set_relay_ang(void)
+{
+  static U8   currentAnCh;
+  
+  SetCurrentDac(AnalogArray[currentAnCh], currentAnCh);
+  SetRelay(RelayOuts);
+  if(++currentAnCh == 16) currentAnCh= 0;  
+}
+// ################################################# SPI1 -  управление платой реле, тока, коммутатром ###################################################
+
+// ################################################# SPI3 -  флеш на spi ###################################################
+/*  ожидание spi памяти */
+U8  wait_spimem_ready(void)
+{
+  U8 rSR, try_count;   
+    
+  for(try_count= 0; try_count < 20; try_count++)
+  {
+    MEM_SEL;
+    shift_byte_spi3(RDSR); 
+    rSR = shift_byte_spi3(0xff);
+    MEM_DES;
+    if(!(rSR & WIP_SR)) return 0;
+    OS_Delay(1);
+  }
+  return 1;
+}
+
+/*  запись spi памяти  */
+U8  write_spimem(U16 adr, pU8 buffer, U16 lenght)
+{
+  div_t   n;
+  U8      num_write_byte, i;
+    
+  OS_Use( &SemaSPI3 );
+  do 
+  {
+    if(wait_spimem_ready()) 
+    { 
+      // SDCard - too sensitive
+      for(i = 0; i < 10; i++) shift_byte_spi3(0xff);                     // 80 тактов "1" 
+      OS_Unuse( &SemaSPI3 ); 
+      return 1; 
+    } // error
+    
+    // разрешить запись
+    MEM_SEL;
+    shift_byte_spi3(WREN);  
+    MEM_DES;
+    
+    n= div(adr, SPIMEM_PAGE_SIZE);
+    num_write_byte= SPIMEM_PAGE_SIZE - n.rem;
+    if(num_write_byte > lenght) num_write_byte= lenght;
+    
+    // запись
+    MEM_SEL;
+    shift_byte_spi3(WRITE); 
+      shift_byte_spi3(adr>>8); 
+        shift_byte_spi3(adr);  // send write adr
+    for(i= 0; i < num_write_byte; i++) 
+    { 
+      shift_byte_spi3(*buffer); 
+      buffer++; 
+    }
+    MEM_DES;
+    
+    adr+=     num_write_byte;
+    lenght-=  num_write_byte;
+  } while(lenght); 
+  
+  // SDCard - too sensitive
+  for(i = 0; i < 10; i++) shift_byte_spi3(0xff);                     // 80 тактов "1" 
+  OS_Unuse( &SemaSPI3 );
+  return 0; // no errors
+}
+
+/*  чтение spi памяти  */
+U8  read_spimem(U16 adr, pU8 buffer, U16 lenght)
+{
+  U16     i;
+
+  OS_Use( &SemaSPI3 );
+  if( wait_spimem_ready()) 
+  { 
+    // SDCard - too sensitive
+    for(i = 0; i < 10; i++) shift_byte_spi3(0xff);                     // 80 тактов "1" 
+    OS_Unuse( &SemaSPI3 ); 
+    return 1; 
+  } // error
+
+  // чтение
+  MEM_SEL;
+  shift_byte_spi3(READ); 
+      shift_byte_spi3(adr>>8); 
+        shift_byte_spi3(adr);  // send read adr
+  for(i= 0; i < lenght; i++) 
+  { 
+    *buffer = shift_byte_spi3(0xff);
+    buffer++; 
+  }
+  MEM_DES;
+  
+  // SDCard - too sensitive
+  for(i = 0; i < 10; i++) shift_byte_spi3(0xff);                     // 80 тактов "1" 
+  OS_Unuse( &SemaSPI3 );
+  return 0; // no errors
+}
+// ################################################# SPI3 -  флеш на spi ###################################################
+
+void LoadAndCheckConfig(void)
+{
+  /* проверка памяти конфигурации, загрузка конфигурации, проверка конфигурации */
+  errors_flags.config_memory_fail = read_spimem(CONFIGSPIADR, (pInt8U)ConfigBeginAddr, CONFIGSIZE);
+  
+  if(!errors_flags.config_memory_fail)
+  {
+    if((ConfigWord & CONFIG_MASK) != (~InvConfigWord & CONFIG_MASK)) 
+    {
+      read_spimem(DEFCONFIGSPIADR, (pInt8U)ConfigBeginAddr, CONFIGSIZE);
+      errors_flags.load_default= 1;
+      if((ConfigWord & CONFIG_MASK) != (~InvConfigWord & CONFIG_MASK)) 
+      { 
+        errors_flags.config_fail=  1; 
+        errors_flags.load_default= 0; 
+      }
+      else write_spimem(CONFIGSPIADR, (pInt8U)ConfigBeginAddr, CONFIGSIZE);  // автоматическое восстановление конфигурации
+    }
+  }
+  
+  /* загрузка аварийного минимума */
+  if(errors_flags.config_memory_fail || errors_flags.config_fail) 
+  {    
+    ConfigWord       =  S115200;
+    NetAddress       =  1;
+    Uref             =  2.5;
+    
+    memcpy(SerialNumber, "10000000", 9);
+    memcpy(DeviceName, "Блок управления", 16);
+    
+    TFT_Calib[0][0]     =    -47;       // (0.183 * x - 47);
+    TFT_Calib[0][1]     =  0.183;    
+    TFT_Calib[1][0]     =    -44;       // (0.193 * y - 44);
+    TFT_Calib[1][1]     =  0.193;
+    
+    TCPIPConfig.UseDHCP =  0;
+    TCPIPConfig.IP      = ((U32)192 << 24) + (168L << 16) + (1L << 8)   + 241L;   // 192.168.1.241
+    TCPIPConfig.Gate    = ((U32)192 << 24) + (168L << 16) + (1L << 8)   + 1L;     // 192.168.1.1
+    TCPIPConfig.Mask    = ((U32)255 << 24) + (255L << 16) + (255L << 8) + 0L;     // 255.255.255.0
+    Brightness          = 75;
+  }
+  else
+  {  
+    DeviceName[31] = SerialNumber[8] = 0;
+  }
+  
+  for(U8 i = 0; i < MAX_OUTS; i++) ProgramStatus[i].data = OutConfig[i].ProgramStatus;
+}
+
+void ConfigDeal(void)
+{
+    /* операции с кофигурацией по умолчанию */
+    /* текущую конфу сделать дефолтной */
+    if(system_flags.writedefaultmem)
+    {     
+      OS_Use( &SemaRAM);  
+      
+        write_spimem( DEFCONFIGSPIADR, (pInt8U)(ConfigBeginAddr), CONFIGSIZE);
+        system_flags.writedefaultmem = 0; 
+      
+      OS_Unuse( &SemaRAM);
+    }
+    
+    /* загрузить дефолтную конфу */
+    if(system_flags.readdefaultmem)
+    {
+      OS_Use( &SemaRAM);
+        read_spimem( DEFCONFIGSPIADR, (pInt8U)(ConfigBeginAddr), CONFIGSIZE);  // грузим в ОЗУ конфигурацию
+        CLEAR_IWDG;
+        write_spimem( CONFIGSPIADR, (pInt8U)(ConfigBeginAddr), CONFIGSIZE);    // записываем в текущую дефолтную конфигурацию
+        HW_RESET;    
+    }
+    
+    /* проверить ошибки конфигурации "на ходу" */
+    if( ((ConfigWord & CONFIG_MASK) != (~InvConfigWord & CONFIG_MASK)) || 
+          errors_flags.config_memory_fail || errors_flags.sd_fail )         HW_RESET;  /* перезапуск системы */
+}
+
+void  SoundDeal(void)
+{
+    if (ConfigWord & ERROR_BEEP)
+    {
+      Int8U error = ErrorsPresent();
+      
+      if (error == ERRORS_PRESENT)
+      {
+        if (EBeep != ERRORS_PRESENT)
+        {
+          EBeep = ERRORS_PRESENT;
+          set_sound(R_SOUND_1000_2000);
+          BeepControl = 1;
+        }
+      }
+      else if (error == ERRORS_NOT_PRESENT)
+        EBeep = ERRORS_NOT_PRESENT;
+    }
+    else EBeep = ERRORS_NOT_PRESENT;
+
+    if ((ConfigWord & TRSH_BEEP) && (EBeep == ERRORS_NOT_PRESENT))
+    {
+      Int8U violation = ThresholdsViolated();
+      
+      if (violation & ALARM_VIOLATION)
+      {
+        if (TBeep != ALARM_VIOLATION)
+        {
+          TBeep = ALARM_VIOLATION;
+          set_sound(R_SOUND_300_600);
+          BeepControl = 1;
+        }
+      }
+      else if (violation & ATTENTION_VIOLATION)
+      {
+        if (TBeep != ATTENTION_VIOLATION)
+        {
+          TBeep = ATTENTION_VIOLATION;
+          set_sound(R_SOUND_500_1000);
+          BeepControl = 1;
+        }
+      }
+      else if (violation == NO_VIOLATION)
+        TBeep = NO_VIOLATION;
+    }
+    else TBeep = NO_VIOLATION;
+    
+    if (BeepControl)
+      if (!EBeep && !TBeep)
+      {
+        set_sound(OFF_SOUND);
+        BeepControl = 0;
+       }
+}
+
+Int32U EncodeDate(int* s, int* mi, int* h, int* d, int* m, int* y)
+{ 
+  const U16 month[12]=   { 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365 };
+  const U16 month_v[12]= { 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335, 366 };
+  
+  U32 T = (*s) + (*mi)*60 + (*h)*60*60;
+  U32 D = (*d-1)*24*60*60;
+  
+  if (*m!=1)
+  {
+    if ((*y%4==0) && ((*y%400==0) || (*y%100!=0))) D+=month_v[*m-2]*24*60*60;
+    else D+=month[*m-2]*24*60*60;
+  }
+  for (U16 i=0; i<*y-2000; i++)
+  {
+    if (((2000+i)%4==0) && (((2000+i)%400==0) || ((2000+i)%100!=0)))  D += 366*24*60*60;
+    else                                                              D += 365*24*60*60;
+  }
+  return T+D;
+}
+
+const U8 days_per_month[13]= { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31, 29 };
+
+
+void ParseDate(Int32U* t, int* s, int* mi, int* h, int* d, int* m, int* y)
+{    
+  U32 allseconds = *t;
+  U16 year;
+  U8  month, day, our, minute, second, k, long_year;
+  
+  udiv_t        ss1;
+  div_t         ss2;
+  ss1.quot=   allseconds/86400;
+  ss1.rem=   allseconds%86400;
+  
+  year=  2000;
+  month= 1;
+  day=   1;
+  
+  ss1.quot++;
+  
+  while(ss1.quot)
+  {   
+    if ((year%4==0) && ((year%400==0) || (year%100!=0))) long_year= 1;
+    else                                long_year= 0;
+    for(U8 i= 0; i < 12; i++)
+    {
+      if((i == 1) && long_year) k = 12;
+      else                      k = i;
+      if(ss1.quot > days_per_month[k]) ss1.quot -= days_per_month[k];
+      else break;
+      month++;
+    }
+    if(month < 13) 
+    {
+      day = ss1.quot;
+      break;
+    }
+    month= 1;
+    year++;
+  }
+  ss2= div(ss1.rem, 3600);
+  our= ss2.quot;  
+  minute= ss2.rem / 60;
+  second= ss2.rem - minute * 60;
+
+  *s=second;
+  *mi=minute;
+  *h=our;
+  *d=day;
+  *m=month;
+  *y=year;
+}
+
+static const U8    Key[2] = { BACK_BUTTON, SWITCH_BUTTON };
+// кнопки на шильде
+void scan_key(void)
+{  
+ static U8  keyTimer[2];
+ 
+  if( !(GPIOC_IDR & (1<<9)) )
+  {
+    if(++keyTimer[0] >= 4)
+    {
+      OS_PutMailCond1( &Key_MB, &Key[0]);      
+      keyTimer[0] = 0;
+      OS_RetriggerTimer( &TFTTimer);
+    }
+  }
+  else keyTimer[0] = 0;
+  
+  if( !(GPIOC_IDR & (1<<8)) )
+  {
+    if(++keyTimer[1] >= 4)
+    {
+      OS_PutMailCond1( &Key_MB, &Key[1]);
+      keyTimer[1] = 0;
+      OS_RetriggerTimer( &TFTTimer);
+    }
+  }
+  else keyTimer[1] = 0;  
+}
+
+/* сканирование тач-панели */
+void scan_touch(void)
+{
+  static U32    keyPosition  =   0xffffffff;
+  static U8     keyTimer, xy = 1, needCalib;
+  static S32    xs, ys;
+  S32           x, y;
+  
+  ADC2_CONVERTION;
+  if(xy)
+  {
+    // Y-axis
+    if(ADC2_JDR2 < 0xC00) keyPosition  = (keyPosition & 0xffff) + ((U32)ADC2_JDR2 << 16);
+    else                  keyPosition |= 0xffff0000;
+  }
+  else
+  {
+     // X-axis
+    if(ADC2_JDR1 < 0xC00) keyPosition  = (keyPosition & 0xffff0000) + (U32)ADC2_JDR1;
+    else                  keyPosition |= 0xffff;
+  } 
+    
+  if( ((keyPosition & 0xffff) != 0xffff) && ((keyPosition >> 16) != 0xffff) )
+  {
+    #ifdef TFT32
+      x = keyPosition & 0xffff;
+      y = keyPosition >> 16;
+    #endif
+        
+    #ifdef TFT51
+      y = keyPosition & 0xffff;
+      x = keyPosition >> 16;
+    #endif
+        
+    #ifdef TFT71
+      x = keyPosition & 0xffff;
+      y = keyPosition >> 16;        
+    #endif
+    
+    if(!system_flags.touch_calib)
+    {
+      x= (int)(TFT_Calib[0][1] * x + TFT_Calib[0][0]); 
+      if(x < 0)                  x = 0;
+      else if(x > RESOLUTION_X)  x = RESOLUTION_X; 
+      
+      y= (int)(TFT_Calib[1][1] * y + TFT_Calib[1][0]);
+      if(y < 0)                  y = 0;
+      else if(y > RESOLUTION_Y)  y = RESOLUTION_Y;
+    }
+      
+    if(keyTimer++ == 0) 
+    {
+      xs = x;
+      ys = y;
+    }
+    else  if(keyTimer != 2)
+    {
+      if( (abs(xs - x) < 60) && (abs(ys - y) < 60))
+      {
+        xs = (xs + x)/2;
+        ys = (ys + y)/2;
+      }
+      else keyTimer = 0;
+    }
+    else
+    {
+      keyPosition= ((U32)ys << 16) + xs;
+      if (ys == 0 && xs == 0) 
+      {
+        needCalib++;
+        if(needCalib > 5)
+        {
+          needCalib = 0;
+          OS_Use( &SemaRAM);
+          system_flags.ScreenCalib = 1;
+          OS_Unuse( &SemaRAM);
+        }
+      }
+       
+      OS_RetriggerTimer( &TFTTimer);
+      OS_PutMailCond( &TouchPad_MB, &keyPosition);
+      keyPosition    = 0xffffffff;
+      keyTimer       =  0;
+    }
+  }
+  else keyTimer = 0;               
+    
+  /* X <-> Y ось */
+  if(xy)  { SCAN_PANEL_XA; }
+  else    { SCAN_PANEL_YA; }
+  xy ^= 1;  
+}
+
+/* звуки природы ... */
+void set_sound(U8 soundtype)
+{
+  if (soundtype != OFF_SOUND)
+    if ((LastSound & BIT7) && !(soundtype & BIT7))
+      return;
+
+  TIM2_CR1&=  ~BIT0;
+  TIM2_ARR=   SoundArr[soundtype & 0x7f][0];
+  TIM2_CCR1=  SoundArr[soundtype & 0x7f][1];
+  TIM2_EGR=   BIT0;
+  TIM2_CCER=  BIT0;                           // OUTput Enable  - для первого раза  
+  
+  if(soundtype & BIT7)   TIM2_CR1 &= ~BIT3;    // пик-пик-пик-...
+  else                   TIM2_CR1 |=  BIT3;    // пик.
+  
+  TIM2_CR1|=  BIT0;
+  
+  LastSound = soundtype;
+}
+
+void check_stat_timer()
+{
+  if(StatTimer >= StatisticPeriod) 
+  {
+    OS_SignalEvent( 2, &OS_SUPERVISER);  // записать точку статистики немедленно, WriteStatAddr запишется в StatisticManager()
+    StatTimer = 0;
+  }
+}
+
+/* программный таймер на 1 секунду */
+void oneSecISR(void)
+{
+  OS_RetriggerTimer( &OneSecTimer);
+  
+  OS_SignalEvent( 1, &OS_SUPERVISER);
+  StatTimer++;
+  
+  if (DownCount) DownCount--;
+  
+  if (ConfigWord & PUMP_CONTROL_DEVICE)
+  {
+    if ((ConfigWord & MEASURE_MODE_AUTO) && (CHECK_PUMP))
+    {
+      check_stat_timer();
+    }
+  }
+  else
+  {
+    check_stat_timer();
+  }
+}
+
+void PumpISR(void)
+{
+  PUMP_OFF;
+  OS_SignalEvent( 2, &OS_SUPERVISER);  // записать точку статистики немедленно, WriteStatAddr запишется в StatisticManager()
+  set_sound(S_SOUND_300);
+}
+
+void TFTISR(void)
+{
+#ifndef LED
+  OS_SignalEvent( 1, &OS_TFT);  // записать точку статистики немедленно, WriteStatAddr запишется в StatisticManager()
+  OS_RetriggerTimer( &TFTTimer);
+#endif
+}
+
+// hex conversions
+Int8U  hex_to_char(Int8U pos,pInt8U pBuffer)
+{
+     Int8U  a,b;
+     
+     a= pBuffer[pos] - 48;
+     if(a>9) a-= 7;
+           
+     b= pBuffer[pos+1] - 48;
+     if(b>9) b-= 7;
+           
+     return((a<<4) | b);
+}
+
+Int16U   hex_to_int(Int8U pos,pInt8U pBuffer)
+{
+     return ((hex_to_char(pos,pBuffer)<<8) + hex_to_char(pos+2,pBuffer));
+}
+
+Int16U   char_to_hex(Int8U cnum)
+{
+      Int8U  a,b;
+      
+      a= (cnum & 0x0f);
+      b= (cnum & 0xf0)>>4;
+      
+      if(a>9) a+= 55;
+          else a+= 48;
+          
+      if(b>9) b+= 55;
+          else b+= 48;
+          
+      return(a | (b<<8));
+}
+
+// check sum 
+Int8U check_sum8(pInt8U pBuffer, Int16U len)
+{     
+  Int8U crc= 0;
+  
+  for(Int16U i= 0; i<len; i++) crc+= pBuffer[i];
+  return crc;
+}
+
+void  hexbuffer_2_binbuffer(pInt8U hexBuffer,pInt8U binBuffer,Int16U nBytes,Int16U Pointer)
+{
+  for(Int16U i=0;i<nBytes;i++,Pointer+= 2) binBuffer[i]= hex_to_char(Pointer,hexBuffer);
+}
+
+void  binbuffer_2_hexbuffer(pInt8U hexBuffer,pInt8U binBuffer,Int16U nBytes,Int16U Pointer)
+{
+  for(Int16U i=0,codedbyte;i<nBytes;i++) 
+  {
+    codedbyte=  char_to_hex(binBuffer[i]);
+    hexBuffer[Pointer++]= codedbyte>>8;
+    hexBuffer[Pointer++]= codedbyte;
+  }
+}
+
+void  binbuffer_2_binbuffer(pInt8U pBufferSource,pInt8U pBufferDestination,Int16U nBytes)
+{
+  for(Int16U i=0;i<nBytes;i++) pBufferDestination[i]= pBufferSource[i];
+}
+
+Int32U check_sum32(pInt32U pBuffer,Int32U Size)
+{
+  Int32U    crc,i;
+  
+  for(i = 0, crc = 0, Size /= 4; i < Size; i++)  crc+= pBuffer[i];
+  return crc;
+}
+
+Int8U GetDisplayChannelsCount()
+{
+  Int8U count = 0;
+  
+  for (int i = 0; i < 16; i++)
+    if (DisplayConfig[i].DisplayParam[0] != 255)
+      count++;
+  else
+    break;
+  
+  return count;
+}
+
+Int8U GetDisplayChannelParamsCount(Int8U display_config)
+{
+  Int8U count = 0;
+  
+  for (int i = 0; i < 6; i++)
+    if (DisplayConfig[display_config].DisplayParam[i] != 255)
+      count++;
+  else
+    break;
+    
+   return count;
+}
+
+Int8U GetDisplayChannelChosenParamsCount(Int8U display_config)
+{
+  Int8U count = 0;
+  
+  for (int i = 0; i < 6; i++)
+    if (DisplayConfig[display_config].DisplayParam[i] != 255)
+    {
+      if (DisplayConfig[display_config].ParamConfig[i] & PARAM_ON_MAINSCREEN) count++;
+    }
+    else
+    {
+      break;
+    }
+    
+   return count;
+}
+
+void GetChosenParams(Int8U display_config, int* first, int* second)
+{
+  *first = -1;
+  *second = -1;
+  
+  for (int i = 0; i < 6; i++)
+    if (DisplayConfig[display_config].DisplayParam[i] != 255)
+      if (DisplayConfig[display_config].ParamConfig[i] & PARAM_ON_MAINSCREEN)
+        if (*first == -1)
+          *first = i;
+        else if (*second == -1)
+          *second = i;
+}
+
+void GetChosenParamsMask(Int8U display_config, int* mask)
+{
+  *mask = 0;
+  
+  for (int i = 0; i < 6; i++)
+  {
+    if (DisplayConfig[display_config].DisplayParam[i] != 255)
+    {
+      if (DisplayConfig[display_config].ParamConfig[i] & PARAM_ON_MAINSCREEN)
+      {
+        *mask |= (1 << i);
+      }
+    }
+  }
+}
+
+Int8U GetRectParam(Int8U display_config, Int8U rect_index)
+{
+  for (int i = 0; i < 6; i++)
+    if ((DisplayConfig[display_config].ParamConfig[i] & PARAM_PLACEMENT_MASK) == rect_index)
+      return i;
+  
+  return 255;
+}
+
+Int8U GetParamRect(Int8U display_config, Int8U param_index)
+{
+  for (int i = 0; i < 12; i++)
+    if ((DisplayConfig[display_config].ParamConfig[param_index] & PARAM_PLACEMENT_MASK) == i)
+      return i;
+  
+  return 255;
+}
+
+Int8U GetParametersCount()
+{
+  Int8U parameters_count = 0;
+  
+  Int8U channels_count = GetDisplayChannelsCount();
+  for (int i = 0; i < channels_count; i++)
+    parameters_count += GetDisplayChannelParamsCount(i);
+
+  return parameters_count;
+}
+
+void GetMeasureString(Int8U display_channel_index, Int8U dispay_param_index, char* display, Int16U* color)
+{
+  char value[20];
+  char units[20];
+  
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  if (ErrorArray[param_index])
+  {
+    sprintf(display, "---"/*"ОШИБКА"*/);
+    *color = RED;
+  }
+  else
+  {
+    Int8U pt = MeasureAttribute[param_index].ParamType;
+    Int8U ut = MeasureAttribute[param_index].UnitType;
+    
+    sprintf(value, "%.*f", MeasureAttribute[param_index].DecPoint, MainArray[param_index]);
+    sprintf(units, "%s", UNIT_TYPES[ut]);
+    sprintf(display, "%s %s", value, units);
+
+    *color = ((DisplayConfig[display_channel_index].TreshConfig[dispay_param_index*2].Status == 1) || (DisplayConfig[display_channel_index].TreshConfig[dispay_param_index*2+1].Status == 1)) ? RED : DEEPBLUE/*BROWN*/;
+  }
+}
+
+void GetMeasureStringNoUnits(Int8U display_channel_index, Int8U dispay_param_index, char* display, Int16U* color)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  if (ErrorArray[param_index])
+  {
+    sprintf(display, "---"/*"ОШИБКА"*/);
+    *color = RED;
+  }
+  else
+  {
+    sprintf(display, "%.*f", MeasureAttribute[param_index].DecPoint, MainArray[param_index]);
+    *color = ((DisplayConfig[display_channel_index].TreshConfig[dispay_param_index*2].Status == 1) || (DisplayConfig[display_channel_index].TreshConfig[dispay_param_index*2+1].Status == 1)) ? RED : DEEPBLUE;
+  }
+}
+
+void GetParamMinMax(Int8U display_channel_index, Int8U dispay_param_index, float* min, float* max)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  *min = MeasureAttribute[param_index].LowLimit;
+  *max = MeasureAttribute[param_index].UpLimit;
+}
+
+void GetParamString(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  char param_string[25];
+  GetParamTypeAndUnits(display_channel_index, dispay_param_index, param_string);
+  
+  sprintf(display, "[К%d]%s", display_channel_index+1, param_string);
+}
+
+void GetParamStringByMeasureAttribute(Int8U measure_attribute, char* display)
+{
+  sprintf(display, "---"/*"ОШИБКА"*/);
+  for (int i = 0; i < GetDisplayChannelsCount(); i++)
+  {
+    for (int j = 0; j < GetDisplayChannelParamsCount(i); j++)
+    {
+      if (DisplayConfig[i].DisplayParam[j] == measure_attribute)
+      {
+        GetParamString(i, j, display);
+        return;
+      }
+    }
+  }
+}
+
+void GetParamTypeAndUnits(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  char param[20];
+  char units[20];
+  
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  Int8U pt = MeasureAttribute[param_index].ParamType;
+  Int8U ut = MeasureAttribute[param_index].UnitType;
+    
+  sprintf(param, "%s", PARAM_TYPES[pt]);
+  sprintf(units, "%s", UNIT_TYPES[ut]);
+  sprintf(display, "%s,%s", param, units);
+}
+
+void GetParamNameAndUnits(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  char param[30];
+  char units[20];
+  
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  Int8U pt = MeasureAttribute[param_index].ParamType;
+  Int8U ut = MeasureAttribute[param_index].UnitType;
+    
+  sprintf(param, "%s", PARAM_NAMES[pt]);
+  sprintf(units, "%s", UNIT_TYPES[ut]);
+  sprintf(display, "%s, %s", param, units);
+}
+
+void GetParamName(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  Int8U pt = MeasureAttribute[param_index].ParamType;
+  sprintf(display, "%s", PARAM_NAMES[pt]);
+}
+
+void GetParamType(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  Int8U pt = MeasureAttribute[param_index].ParamType;
+  sprintf(display, "%s", PARAM_TYPES[pt]);
+}
+
+void GetParamUnits(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  Int8U ut = MeasureAttribute[param_index].UnitType;
+  sprintf(display, "%s", UNIT_TYPES[ut]);
+}
+
+void GetParamValueForWS(Int8U display_channel_index, Int8U dispay_param_index, char* display, Int8U* red)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  if (ErrorArray[param_index])
+  {
+    sprintf(display, "---");
+    *red = 1;
+  }
+  else
+  {
+    sprintf(display, "%.*f", MeasureAttribute[param_index].DecPoint, MainArray[param_index]);
+    *red = ((DisplayConfig[display_channel_index].TreshConfig[dispay_param_index*2].Status == 1) || (DisplayConfig[display_channel_index].TreshConfig[dispay_param_index*2+1].Status == 1)) ? 1 : 0;
+  }
+}
+
+void GetParamUnitsForWS(Int8U display_channel_index, Int8U dispay_param_index, char* display)
+{
+  Int8U param_index = DisplayConfig[display_channel_index].DisplayParam[dispay_param_index];
+  
+  Int8U ut = MeasureAttribute[param_index].UnitType;
+  sprintf(display, "%s", UNIT_TYPES[ut]);
+
+  strdel_(display, '^');
+  strdel_(display, 'v');
+}
+
+Int8U GetOutChannelsCount()
+{
+  Int8U count = 0;
+  
+  for (int i = 0; i < 16; i++)
+    if (OutConfig[i].ChanelType != NO_CONTROL)
+      count++;
+  else
+    break;
+  
+  return count;
+}
+
+Int8U GetControlChannelMeasureAttributeIndex(Int8U input)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  return DisplayConfig[dispConfNum].DisplayParam[paramNumd];
+}
+
+Int8U GetControlChannelDecimal(Int8U input)
+{
+  return MeasureAttribute[GetControlChannelMeasureAttributeIndex(input)].DecPoint;
+}
+
+Int8U GetControlChannelUnitType(Int8U input)
+{
+  return MeasureAttribute[GetControlChannelMeasureAttributeIndex(input)].UnitType;
+}
+
+void GetControlChannelInputMeasureString(Int8U input, char* display, Int16U* color)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  GetMeasureString(dispConfNum, paramNumd, display, color);
+}
+
+void GetControlChannelInputMeasureStringNoUnits(Int8U input, char* display, Int16U* color)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  GetMeasureStringNoUnits(dispConfNum, paramNumd, display, color);
+}
+
+void GetControlChannelInputParamString(Int8U input, char* param)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  char param_string[20];
+  GetParamTypeAndUnits(dispConfNum, paramNumd, param_string);
+  
+  sprintf(param, "[К%d]%s", dispConfNum+1, param_string);
+}
+
+void GetControlChannelInputParamTypeAndUnits(Int8U input, char* type_and_units)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  GetParamTypeAndUnits(dispConfNum, paramNumd, type_and_units);
+}
+
+void GetControlChannelInputThreshold1String(Int8U input, char* threshold1)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  Int8U index = DisplayConfig[dispConfNum].DisplayParam[paramNumd];
+  Int8U decimal = MeasureAttribute[index].DecPoint;
+  Flo32 threshold = DisplayConfig[dispConfNum].Treshold[paramNumd*2];
+  
+  if (DisplayConfig[dispConfNum].TreshConfig[paramNumd*2].Up) sprintf(threshold1, "(В) %.*f", decimal, threshold);
+  else                                                        sprintf(threshold1, "(Н) %.*f", decimal, threshold);
+}
+
+void GetControlChannelInputThreshold2String(Int8U input, char* threshold2)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  Int8U index = DisplayConfig[dispConfNum].DisplayParam[paramNumd];
+  Int8U decimal = MeasureAttribute[index].DecPoint;
+  Flo32 threshold = DisplayConfig[dispConfNum].Treshold[paramNumd*2+1];
+  
+  if (DisplayConfig[dispConfNum].TreshConfig[paramNumd*2+1].Up) sprintf(threshold2, "(В) %.*f", decimal, threshold);
+  else                                                          sprintf(threshold2, "(Н) %.*f", decimal, threshold);
+}
+
+void GetControlChannelInputThresholdsString(Int8U input, char* thresholds)
+{
+  Int8U   dispConfNum, paramNumd;
+  
+  dispConfNum=  input >> 3;
+  paramNumd=    input & 7;
+  
+  Int8U index = DisplayConfig[dispConfNum].DisplayParam[paramNumd];
+  Int8U decimal = MeasureAttribute[index].DecPoint;
+  
+  Flo32 threshold1 = DisplayConfig[dispConfNum].Treshold[paramNumd*2];
+  Flo32 threshold2 = DisplayConfig[dispConfNum].Treshold[paramNumd*2+1];
+  sprintf(thresholds, "%.*f|%.*f", decimal, threshold1, decimal, threshold2);
+}
+
+void GetControlChannelInputParamMinMax(Int8U input, float* min, float* max)
+{
+  Int8U param_index = GetControlChannelMeasureAttributeIndex(input);
+  
+  *min = MeasureAttribute[param_index].LowLimit;
+  *max = MeasureAttribute[param_index].UpLimit;
+}
+
+void IncrementDisplayParam(Int8U* display_channel, Int8U* display_param)
+{
+  Int8U channels_count = GetDisplayChannelsCount();
+  Int8U params_count = GetDisplayChannelParamsCount(*display_channel);
+
+  if (channels_count == 0) return;
+
+  do
+  {
+    if (*display_channel >= channels_count)
+    {
+      *display_channel = 0;
+      *display_param = 0;
+      params_count = GetDisplayChannelParamsCount(*display_channel);
+      continue;
+    }
+    
+    if (*display_param >= params_count)
+    {
+      *display_channel = *display_channel+1;
+      *display_param = 0;
+      params_count = GetDisplayChannelParamsCount(*display_channel);
+      continue;
+    }
+    
+    *display_param = *display_param+1;
+  } while ((*display_param >= params_count) || (*display_channel >= channels_count));
+}
+
+void DecrementDisplayParam(Int8U* display_channel, Int8U* display_param)
+{
+  Int8U channels_count = GetDisplayChannelsCount();
+  Int8U params_count = GetDisplayChannelParamsCount(*display_channel);
+
+  if (channels_count == 0) return;
+
+  do
+  {
+    if (*display_channel >= channels_count)
+    {
+      *display_channel = channels_count-1;
+      params_count = GetDisplayChannelParamsCount(*display_channel);
+      *display_param = params_count-1;
+      continue;
+    }
+    
+    if (*display_param >= params_count)
+    {
+      *display_channel = *display_channel-1;
+      params_count = GetDisplayChannelParamsCount(*display_channel);
+      *display_param = params_count-1;
+      continue;
+    }
+    
+    *display_param = *display_param-1;
+  } while ((*display_param >= params_count) || (*display_channel >= channels_count));
+}
+
+void IncrementControlChannelInputParam(Int8U* input)
+{
+  Int8U   dispConfNum, paramNumd;
+  Int8U   channels_count, params_count;
+  
+  dispConfNum=  *input >> 3;
+  paramNumd=    *input & 7;
+  
+  channels_count = GetDisplayChannelsCount();
+  params_count = GetDisplayChannelParamsCount(dispConfNum);
+  
+  if (channels_count == 0) return;
+
+  do
+  {
+    if (dispConfNum >= channels_count)
+    {
+      dispConfNum = 0;
+      paramNumd = 0;
+      params_count = GetDisplayChannelParamsCount(dispConfNum);
+      continue;
+    }
+    
+    if (paramNumd >= params_count)
+    {
+      dispConfNum++;
+      paramNumd = 0;
+      params_count = GetDisplayChannelParamsCount(dispConfNum);
+      continue;
+    }
+    
+    paramNumd++;
+  } while ((paramNumd >= params_count) || (dispConfNum >= channels_count));
+  
+  *input = (dispConfNum << 3) | paramNumd;
+}
+
+void IncrementControlChannelHesterParam(Int8U* input, Int8U unit_type)
+{
+  Int8U   dispConfNum, paramNumd;
+  Int8U   channels_count, params_count;
+  
+  dispConfNum=  *input >> 3;
+  paramNumd=    *input & 7;
+  
+  channels_count = GetDisplayChannelsCount();
+  params_count = GetDisplayChannelParamsCount(dispConfNum);
+  
+  if (channels_count == 0) return;
+
+  do
+  {
+    do
+    {
+      if (dispConfNum >= channels_count)
+      {
+        dispConfNum = 0;
+        paramNumd = 0;
+        params_count = GetDisplayChannelParamsCount(dispConfNum);
+        continue;
+      }
+      
+      if (paramNumd >= params_count)
+      {
+        dispConfNum++;
+        paramNumd = 0;
+        params_count = GetDisplayChannelParamsCount(dispConfNum);
+        continue;
+      }
+      
+      paramNumd++;
+    } while ((paramNumd >= params_count) || (dispConfNum >= channels_count));
+    
+    *input = (dispConfNum << 3) | paramNumd;
+  } while (GetControlChannelUnitType(*input) != unit_type);
+}
+
+void IncrementPressureParam(Int8U* measure_attribute)
+{
+  Int8U channels_count = GetDisplayChannelsCount();
+  Int8U params_count;
+  Int8U display_channel, display_param;
+
+  GetDisplayConfigAndParam(*measure_attribute, &display_channel, &display_param);  
+  do
+  {
+    params_count = GetDisplayChannelParamsCount(display_channel);
+  
+    if (display_channel >= channels_count)
+    {
+      display_channel = 0;
+      display_param = 0;
+      continue;
+    }
+    
+    if (display_param >= params_count)
+    {
+      display_channel = display_channel+1;
+      display_param = 0;
+      continue;
+    }
+    
+    display_param = display_param+1;
+  } while ((display_param >= params_count) || (display_channel >= channels_count) || (MeasureAttribute[DisplayConfig[display_channel].DisplayParam[display_param]].ParamType != 3));
+  
+  *measure_attribute = DisplayConfig[display_channel].DisplayParam[display_param];
+}
+
+void ParseIPAddress(Int32U ip, char* display)
+{
+  sprintf(display, "%u.%u.%u.%u", (ip >> 24), (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
+}
+
+void PackIPAddress(Int32U* ip, char* display)
+{
+  int b1, b2, b3, b4;
+  sscanf(display, "%d.%d.%d.%d", &b1, &b2, &b3, &b4);
+  
+  *ip = (b1 << 24) | (b2 << 16) | (b3 << 8) | (b4);
+}
+
+void HTMLColor(Int16U color, char* html_color)
+{
+  //#define RGB565(r, g, b)   (b >> 3) | ((g >> 2) << 5) | ((r >> 3) << 11)
+  Int8U b = color & 0x1F;
+  Int8U g = (color >> 5) & 0x3F;
+  Int8U r = (color >> 11) & 0x1F;
+  
+  sprintf(html_color, "#%.2x%.2x%.2x", r, g, b);
+}
+
+Int16U GetParameterValueForMODBUS(U16 parameter_number, Int8U * buffer)
+{
+  U16  chanel_num       = parameter_number / 32;
+  U16  r_num            = parameter_number % 32;
+  U8   p_num            = r_num / 2 & 7;
+  U16  parameter_index  = DisplayConfig[chanel_num].DisplayParam[p_num];
+  U8   value[4];
+  U8   error            = ErrorArray[parameter_index];
+  
+  *(F32*)value = MainArray[parameter_index];
+  
+  if( r_num < 16 )
+  {
+    buffer[0] = (r_num & 1) ? value[3] : value[1];
+    buffer[1] = (r_num & 1) ? value[2] : value[0];
+    return 0;
+  }
+  else
+  {
+    buffer[0] = buffer[1] = error;
+    return 1;
+  }
+}
+
+Int16U SetParameterValueForMODBUS(U16 register_adr, U16 preset_value) {return 1;}
+
+Int8U ThresholdsViolated()
+{
+  Int8U result = NO_VIOLATION;
+  
+  for (int i = 0; i < GetDisplayChannelsCount(); i++)
+  {
+    for (int j = 0; j < GetDisplayChannelParamsCount(i); j++)
+    {
+      if (DisplayConfig[i].TreshConfig[j*2].Status)
+      {
+        if (DisplayConfig[i].TreshConfig[j*2].Weight)
+          result |= ALARM_VIOLATION;
+        else
+          result |= ATTENTION_VIOLATION;
+      }
+      if (DisplayConfig[i].TreshConfig[j*2+1].Status)
+      {
+        if (DisplayConfig[i].TreshConfig[j*2+1].Weight)
+          result |= ALARM_VIOLATION;
+        else
+          result |= ATTENTION_VIOLATION;
+      }
+    }
+  }
+  
+  return result;
+}
+
+Int8U ErrorsPresent()
+{
+  for (int i = 0; i < GetDisplayChannelsCount(); i++)
+  {
+    for (int j = 0; j < GetDisplayChannelParamsCount(i); j++)
+    {
+      if (ErrorArray[DisplayConfig[i].DisplayParam[j]])
+      {
+        return ERRORS_PRESENT;
+      }
+    }
+  }
+  
+  return ERRORS_NOT_PRESENT;
+}
+
+Int8U HumidityCalculationPossible(Int8U display_config)
+{
+  for (int i = 0; /*(i < 2) &&*/ (i < GetDisplayChannelParamsCount(display_config)); i++)
+  {
+    //если присутствует влажность[°Cтр]
+    if ((MeasureAttribute[DisplayConfig[display_config].DisplayParam[i]].ParamType == 2) && (MeasureAttribute[DisplayConfig[display_config].DisplayParam[i]].UnitType == 2)) return 1;
+  }
+
+  return 0;
+}
+
+Int8U OxygenCalculationPossible(Int8U display_config)
+{
+  for (int i = 0; /*(i < 2) &&*/ (i < GetDisplayChannelParamsCount(display_config)); i++)
+  {
+    //если присутствует кислород [об. %]
+    if ((MeasureAttribute[DisplayConfig[display_config].DisplayParam[i]].ParamType == 4) && (MeasureAttribute[DisplayConfig[display_config].DisplayParam[i]].UnitType == 8)) return 1;
+  }
+
+  return 0;
+}
+
+Int8U PressureCalculationPossible(Int8U display_config)
+{
+  //если P
+  for (int i = 0; /*(i < 2) &&*/ (i < GetDisplayChannelParamsCount(display_config)); i++)
+    if (MeasureAttribute[DisplayConfig[display_config].DisplayParam[i]].ParamType == 3) return 1;
+  return 0;
+  /*if (MeasureAttribute[DisplayConfig[display_config].DisplayParam[0]].ParamType == 3)
+    return 1;
+  else
+    return 0;*/
+}
+
+// тут хранятся константы для пересчёта влажности по давлению
+Int8U GetDewPointParamIndex(Int8U display_config)
+{
+  Int8U measure_attribute;
+  for (int i = 0; i < GetDisplayChannelParamsCount(display_config); i++)
+  {
+     measure_attribute = DisplayConfig[display_config].DisplayParam[i];
+     if ((MeasureAttribute[measure_attribute].ParamType == 2) && (MeasureAttribute[measure_attribute].UnitType == 2)) return i;
+  }
+  
+  return 255;
+}
+
+// тут хранятся константы для пересчёта влажности по давлению
+Int8U GetOxygenParamIndex(Int8U display_config)
+{
+  Int8U measure_attribute;
+  for (int i = 0; i < GetDisplayChannelParamsCount(display_config); i++)
+  {
+     measure_attribute = DisplayConfig[display_config].DisplayParam[i];
+     if ((MeasureAttribute[measure_attribute].ParamType == 4) && (MeasureAttribute[measure_attribute].UnitType == 8)) return i;
+  }
+  
+  return 255;
+}
+
+void SetPressure1Source(Int8U display_config, bool transducer)
+{
+  Int8U measure_attribute;
+  for (int i = 0; i < GetDisplayChannelParamsCount(display_config); i++)
+  {
+    measure_attribute = DisplayConfig[display_config].DisplayParam[i];
+    if (MeasureAttribute[measure_attribute].ParamType == 2)
+    {
+      if (transducer)
+        DisplayConfig[display_config].ParamConfig[i] |= PARAM_PRESSURE1_SOURCE;
+      else
+        DisplayConfig[display_config].ParamConfig[i] &= ~PARAM_PRESSURE1_SOURCE;
+    }
+  }
+}
+
+void SetPressure2Source(Int8U display_config, bool transducer)
+{
+  Int8U measure_attribute;
+  for (int i = 0; i < GetDisplayChannelParamsCount(display_config); i++)
+  {
+    measure_attribute = DisplayConfig[display_config].DisplayParam[i];
+    if (MeasureAttribute[measure_attribute].ParamType == 2)
+    {
+      if (transducer)
+        DisplayConfig[display_config].ParamConfig[i] |= PARAM_PRESSURE2_SOURCE;
+      else
+        DisplayConfig[display_config].ParamConfig[i] &= ~PARAM_PRESSURE2_SOURCE;
+    }
+  }
+}
+
+Int8U PressureTransducerExists()
+{
+  for (int i = 0; i < 256; i ++)
+  {
+    //если P
+    if (MeasureAttribute[i].ParamType == 3) return 1;
+  }
+  
+  return 0;
+}
+
+bool IsChannelExists(int channel_index)
+{
+  return DisplayConfig[channel_index].DisplayParam[0] != 255;
+}
+
+void GetDisplayConfigAndParam(Int8U measure_attribute, Int8U* display_config, Int8U* display_param)
+{
+  *display_config = 0;
+  *display_param = 0;
+  
+  for (int i = 0; i < GetDisplayChannelsCount(); i++)
+  {
+    for (int j = 0; j < GetDisplayChannelParamsCount(i); j++)
+    {
+      if (DisplayConfig[i].DisplayParam[j] == measure_attribute)
+      {
+        *display_config = i;
+        *display_param = j;
+        return;
+      }
+    }
+  }
+}
+
+Int8U GetMainScreenMaximumParameters()
+{
+  int channels_count = GetDisplayChannelsCount();
+  if (channels_count > 4)
+  {
+    return 2;
+  }
+  else if (channels_count > 2)
+  {
+    return 4;
+  }
+  else
+  {
+    return 8;
+  }
+}
+
+Int8U GetMainScreenParametersCount(int channel_index)
+{
+  Int8U result = 0;
+  
+  for (int i = 0; i < 6; i++)
+  {
+    if (DisplayConfig[channel_index].DisplayParam[i] != 255)
+    {
+      if (DisplayConfig[channel_index].ParamConfig[i] & PARAM_ON_MAINSCREEN)
+      {
+        result++;
+      }
+    }
+  }
+  return result;
+}
+
+Int8U GetActiveBitIndex(Int8U mask, Int8U bit_order)
+{
+  int cnt = 0;
+  for (int i = 0; i < 8; i++)
+  {
+    if (mask & (1 << i))
+    {
+      if (cnt == bit_order)
+      {
+        return i;
+      }
+      else
+      {
+        cnt++;
+      }
+    }
+  }
+  return 0;
+}
+
+/*  обмен Ексис USB */
+/* check  SUM */
+static bool check_CHKSUM(pU8 buf)
+{
+  Int8U             bytenum, command, i, check_sum;
+  bool              result;
+  
+  command   = buf[4];
+  bytenum   = buf[5];
+          
+  switch(command)
+  {
+    case WF_USB:
+    case WR_USB:      
+    case WI_USB:          
+                    for (i = 0, check_sum = 0xff; i < (6 + bytenum); i++) check_sum += buf[i];
+                    result = (check_sum != buf[6 + bytenum]) ? 1 : 0;
+                    break;
+                    
+    case RR_USB:
+    case RF_USB:      
+    case RI_USB:
+    case IR_USB:      
+    case CR_USB:
+    case CT_USB:
+    case DW_USB:
+    case DR_USB:
+    case RS_USB:
+    case SS_USB:         
+                    for (i = 0, check_sum = 0xff; i < 6; i++) check_sum += buf[i];
+                    result = (check_sum != buf[6]) ? 1 : 0;
+                    break;
+                    
+    case BS_USB:    result = 0;
+                    break;
+      
+    default:  result = 1;
+  }
+  
+  return   result;
+}
+
+/* метки для загрузчика - установить
+  b - true  :0x1234 
+      false :0x0000
+  true - перезапуск системы с целью обновления программы
+*/
+void  set_mark_forbooter(bool b)
+{
+  PWR_CR_bit.DBP=       1;
+    if( b ) BKP_DR1 = 0x1234;
+    else    BKP_DR1 = 0x0000;
+  PWR_CR_bit.DBP=       0;
+}
+
+/* проверка метки для загрузчика
+  true   - перезапуск системы с целью обновления программы
+  false  - обычный перезапуск системы
+*/
+bool  get_mark_forbooter(void)
+{
+  U32 mark;
+  
+  PWR_CR_bit.DBP=       1;
+  mark = BKP_DR1;
+  PWR_CR_bit.DBP=       0;
+  
+  return (mark == 0x1234);
+}
+
+void usb_exchange(pU8 buf)
+{
+  U32 addr      =  *((pU32)buf);
+  U8  command   =  buf[4];
+  U8  bytenum   =  buf[5];
+  U8  response;
+          
+  if( (bytenum > USB_MAX_DATA_LEN) || check_CHKSUM( buf )) goto fail;
+      
+  switch(command)
+  {
+    case WR_USB:  if( ((addr + bytenum) > RAMSIZE) ) goto fail;
+                  OS_Use( &SemaRAM);
+                    memcpy( (void *)(RamBeginAddr + addr), (void *)WDATA_POINTER, bytenum);
+                    if( (RamBeginAddr + addr) == (U32)&Time )  // установить RTC
+                    {
+                      PWR_CR_bit.DBP=       1;
+                      while(!RTC_CRL_bit.RTOFF);
+                      RTC_CRL_bit.CNF=      1;
+                      RTC_CNTL=             (U32)Time & 0xffff;
+                      RTC_CNTH=             (U32)Time >> 16;
+                      RTC_CRL_bit.CNF=      0;
+                      while(!RTC_CRL_bit.RTOFF);
+                      PWR_CR_bit.DBP=       0;
+                    }
+                  OS_Unuse( &SemaRAM);
+                  
+                  PUT_CHK_NUM_ASK(0); 
+                  break;    
+
+    case WI_USB:  if( ((addr + bytenum) > CONFIGSIZE) ) goto fail;
+                  OS_Use( &SemaRAM);
+                    memcpy( (void *)(ConfigBeginAddr + addr), (void *)WDATA_POINTER, bytenum);
+                    USART2_BRR = select_speed( ConfigWord & UART_MASK, APB1);                      
+                    if(ConfigWord & RESTART_STATISTIC)
+                    {
+                      ConfigWord    &= ~(RESTART_STATISTIC + STATISCTIC_OVERFLOW);
+                      WriteStatAddr =   SD_STATISTIC_OFFSET;
+                    }
+                    response = write_spimem( addr, WDATA_POINTER, bytenum);                  
+                    errors_flags.config_memory_fail = errors_flags.config_memory_fail || response;
+                  OS_Unuse( &SemaRAM);
+                  
+                  if( response ) goto fail;                  
+                  PUT_CHK_NUM_ASK(0);
+                  break;
+                  
+    case WF_USB:  if(( addr + bytenum > SD_CARD_SIZE ) || (bytenum != USB_MAX_DATA_LEN) || (addr & 0x7f) ) goto fail;
+                  if( &TP80 != NULL ) OS_SUSPEND_IF_NOT( &TP80);
+                  memcpy( (void *)&web_buffer[addr & 0x1ff], (void *)WDATA_POINTER, USB_MAX_DATA_LEN);
+                  
+                  if( (addr & 0x1ff) == 0x180 ) 
+                  {
+                    OS_Use( &SemaRAM);
+                      response = write_SDCard( web_buffer, addr & 0xfffffe00, 512);
+                      errors_flags.sd_fail = errors_flags.sd_fail || response;
+                    OS_Unuse( &SemaRAM);
+                    if( &TP80 != NULL ) OS_RESUME_IF_NOT( &TP80);
+                  }
+                  else response = 0;
+                  
+                  if( response ) goto fail;                  
+                  PUT_CHK_NUM_ASK(0);
+                  break;                  
+
+    case RI_USB:  if( (addr + bytenum) > CONFIGSIZE )  goto fail;
+                  OS_Use( &SemaRAM);
+                    memcpy( (void *)RDATA_POINTER, (void *)(ConfigBeginAddr + addr), bytenum);
+                  OS_Unuse( &SemaRAM);
+                  
+                  PUT_CHK_NUM_ASK(bytenum);
+                  break;  
+                  
+    case RR_USB:  if( (addr + bytenum) > RAMSIZE )  goto fail;
+                  OS_Use( &SemaRAM);
+                    memcpy( (void *)RDATA_POINTER, (void *)(RamBeginAddr + addr), bytenum);
+                  OS_Unuse( &SemaRAM);
+                  
+                  PUT_CHK_NUM_ASK(bytenum);
+                  break;
+    
+    case RF_USB:  if( addr + bytenum > SD_CARD_SIZE ) goto fail;
+                  OS_Use( &SemaRAM);
+                    response = read_SDCard( RDATA_POINTER, addr, bytenum);                  
+                    errors_flags.sd_fail = errors_flags.sd_fail || response;
+                  OS_Unuse( &SemaRAM);
+                  
+                  if( response ) goto fail;                  
+                  PUT_CHK_NUM_ASK(bytenum);
+                  break;                  
+    
+    case IR_USB:  bytenum = 0;
+                  strcpy( (void *) &buf[bytenum+2], (void *)SerialNumber);              bytenum += strlen(SerialNumber) + 1;
+                  strcpy( (void *) &buf[bytenum+2], (void *)Version);                   bytenum += strlen(Version) + 1;
+                  strcpy( (void *) &buf[bytenum+2], (void *)DeviceName);                bytenum += strlen(DeviceName) + 1;
+                  bytenum += sprintf(&buf[bytenum+2], "VID=%x PID=%x", USBD_VID, USBD_PID) + 1;
+                  
+                  PUT_CHK_NUM_ASK(bytenum);
+                  break;
+     
+    case CR_USB:  bytenum = 0;
+                  memcpy( (pU8)&buf[bytenum+2], (pU8)&IDWordLo, sizeof(IDWordLo) ); bytenum += sizeof(IDWordLo);
+                  memcpy( (pU8)&buf[bytenum+2], (pU8)&IDWordHi, sizeof(IDWordHi) ); bytenum += sizeof(IDWordHi);                  
+
+                  PUT_CHK_NUM_ASK(bytenum);
+                  break;
+                  
+     case CT_USB: OS_Use( &SemaRAM);
+                    system_flags.ScreenCalib = 1;
+                  OS_Unuse( &SemaRAM);
+                      
+                  PUT_CHK_NUM_ASK(0);  
+                  break;
+                  
+     case RS_USB: OS_Use( &SemaRAM);
+                    system_flags.redraw_gui = 1;
+                  OS_Unuse( &SemaRAM);
+                      
+                  PUT_CHK_NUM_ASK(0);   
+                  break;
+       
+     /* копировать текущую конфигурацию в конф. по умолчанию */
+     case DW_USB: OS_Use( &SemaRAM);
+                    system_flags.writedefaultmem = 1;
+                  OS_Unuse( &SemaRAM);
+                  
+                  PUT_CHK_NUM_ASK(0);
+                  break;
+
+     /* копировать конф. по умолчанию в текущую конфигурацию */                  
+     case DR_USB: OS_Use( &SemaRAM);
+                    system_flags.readdefaultmem = 1;
+                  OS_Unuse( &SemaRAM);
+                  
+                  PUT_CHK_NUM_ASK(0);
+                  break;  
+                  
+     /* снять скриншот */
+     case SS_USB: OS_Use( &SemaRAM);
+                    system_flags.ScreenShoot = 1;
+                  OS_Unuse( &SemaRAM);
+                  
+                  PUT_CHK_NUM_ASK(0);       
+                  break;                  
+     
+     case BS_USB: PUT_CHK_NUM_ASK(0);
+                  set_mark_forbooter(1); 
+                  OS_Use( &SemaRAM);
+                    system_flags.start_boot = 1;
+                  OS_Unuse( &SemaRAM);
+                  break;
+                  
+     fail:
+     default:     PUT_CHK_NUM_NAK(0);
+    }    
+}
+

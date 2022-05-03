@@ -1,0 +1,385 @@
+#include "defines.h"
+
+// global
+
+// local static
+U8                            Uart2Buffer[U2BUFLEN];
+U16                           BytesToTransfer;
+static U16                    Rx2Counter;
+
+// установка скорости UARTов
+U16   select_speed(U8 speed, U8 apbn)
+{
+ U32    tim3;
+ U16    br = 0x1d4c;
+ F32    time_out;
+  
+ switch(apbn)
+ {          
+  case APB1:            
+            switch(speed)
+            {
+            case S1200:   time_out  = 0.06;
+                          br        = 0x7530;
+                          break;
+                          
+            case S2400:   time_out  = 0.045;
+                          br        = 0x3A98;
+                          break;
+                          
+            case S4800:   time_out  = 0.03;
+                          br        = 0x1d4c;
+                          break;                          
+                          
+            case S9600:   time_out  = 0.02;
+                          br        = 0xea6;
+                          break;
+                          
+            case S19200:  time_out  = 0.02;
+                          br        = 0x753;
+                          break;
+                          
+            case S38400:  time_out  = 0.01;
+                          br        = 0x3a9;
+                          break;
+                          
+            case S57600:  time_out  = 0.005;
+                          br        = 0x271;
+                          break;
+                          
+            case S115200: time_out  = 0.005;
+                          br        = 0x139;
+                          break;
+                          
+            default:      time_out  = 0.003645;
+                          br        = 0xea6;
+                          break;
+            }
+            tim3       =   time_out * 72000000;
+            TIM3_ARR   =   TIM3_CCR1 = (U16)tim3; 
+            TIM3_PSC   =   (U16)(tim3 >> 16);
+            break;
+          
+  case APB2: switch(speed)
+            {
+            case S1200:   br        = 0xEA60;
+                          break;
+                          
+            case S2400:   br        = 0x7530;
+                          break;
+                          
+            case S4800:   br        = 0x3A98;
+                          break;                          
+                          
+            case S9600:   br        = 0x1d4c;
+                          break;
+                          
+            case S19200:  br        = 0xea6;
+                          break;
+                          
+            case S38400:  br        = 0x753;
+                          break;
+                          
+            case S57600:  br        = 0x4e2;
+                          break;
+                          
+            case S115200: br        = 0x271;
+                          break;
+                          
+            default:      br        = 0x1d4c;
+                          break;                                        
+            }
+            break;
+ }
+ 
+ return br;
+}
+
+// isr TIM3
+#pragma optimize = none
+void  TIM3_ISR(void)
+{
+  OS_EnterInterrupt();
+  
+  TIM3_SR           &=  ~BIT1;
+  TIM3_CR1          &=  ~BIT0;
+  USART2_CR1_bit.RE  =   0;
+  OS_SignalEvent( BIT0, &OS_UARTS);
+  
+  OS_LeaveInterrupt();
+}
+
+// isr uart2
+#pragma optimize = none
+void UART2_ISR(void) 
+{
+  static U16    txCounter;
+  U8            inByte;
+  U32           uart_status;
+  
+  OS_EnterInterrupt();
+  
+  uart_status  = USART2_SR;
+  inByte       = USART2_DR;  
+  
+  if(uart_status & (0x0f)) // FE NE ORE - errors
+  {
+    Rx2Counter    =      0;
+    TIM3_CR1     &=  ~BIT0;
+    TIM3_SR      &=  ~BIT1;
+  }
+  else
+  if(uart_status & (1<<5))  // RXNE
+  {        
+    if(Rx2Counter == U2BUFLEN)   
+    { 
+      Rx2Counter    = 0; 
+      TIM3_CR1     &=  ~BIT0;
+      TIM3_SR      &=  ~BIT1;
+    }
+    else  
+    {
+      Uart2Buffer[Rx2Counter++] = inByte;     
+      //запустить или обнулить таймер
+      TIM3_EGR      |=   BIT0;
+      TIM3_CR1      |=   BIT0;
+    }
+  }
+  
+  if(USART2_CR1_bit.TCIE && (uart_status & (1<<6))) // TC
+  {    
+    if((txCounter == BytesToTransfer) || (txCounter == U2BUFLEN))
+    {
+      txCounter =           0;
+      U2RS485_OFF;
+      USART2_CR1_bit.TCIE=  0;
+      USART2_CR1_bit.RE=    1;
+      if(system_flags.reiniuart2) USART2_BRR = select_speed( ConfigWord & UART_MASK, APB1);
+      if(system_flags.start_boot) HW_RESET;      
+    } 
+    else USART2_DR = Uart2Buffer[txCounter++];
+  }
+  
+  OS_LeaveInterruptNoSwitch();
+}
+
+void UARTS_Task(void) 
+{
+  U16     rxnum;
+  
+  // инициализация UART
+  USART2_BRR=              select_speed(ConfigWord & UART_MASK, APB1);
+  USART2_CR1= USART2_CR2 = USART2_CR3= USART2_GTPR= 0;
+  USART2_CR1_bit.UE =      1;
+  USART2_CR1_bit.RE =      1;
+  USART2_CR1_bit.TE =      1;
+  USART2_CR1_bit.RXNEIE =  1;
+  
+  // инициализация TIM3
+  TIM3_CR1   = 0;                   // 
+  TIM3_CCMR1 = BIT4;                // CC1 
+  TIM3_DIER  = BIT1;                // CC1IE
+  
+  // инициализация в VIC   
+  OS_ARM_InstallISRHandler(NVIC_USART2, (OS_ISR_HANDLER*)UART2_ISR);
+  OS_ARM_ISRSetPrio(NVIC_USART2, 0xFE);
+  OS_ARM_EnableISR(NVIC_USART2); 
+  
+  OS_ARM_InstallISRHandler(NVIC_TIM3, (OS_ISR_HANDLER*)TIM3_ISR);
+  OS_ARM_ISRSetPrio(NVIC_TIM3, 0xFE);
+  OS_ARM_EnableISR(NVIC_TIM3);
+    
+  for(;;)
+  {
+    OS_WaitSingleEvent(BIT0);
+    
+    if(!Rx2Counter)
+    {
+      USART2_CR1_bit.RE = 1;
+      continue;
+    }
+    
+    rxnum       = checkEKSIS(Rx2Counter);
+    Rx2Counter  = 0;  
+
+    if( rxnum )
+    {      
+      if ( check_sum8(Uart2Buffer, rxnum - 2) == hex_to_char(rxnum - 2, Uart2Buffer) )  BytesToTransfer =  EKSIS_ASCII( );
+      else                                                                              BytesToTransfer =  MODBUS_RTU (Uart2Buffer, NetAddress);
+    }
+    else                                                                                BytesToTransfer =  MODBUS_RTU (Uart2Buffer, NetAddress);
+  
+    if( !BytesToTransfer )
+    {
+      memset(Uart2Buffer, 0, U2BUFLEN );
+      USART2_CR1_bit.RE = 1;
+    }
+    else 
+    {        
+      U2RS485_ON;
+      USART2_CR1_bit.TCIE = 1;
+    }       
+  }
+}
+
+U16 checkEKSIS(U16 rxNum)
+{
+  if( (Uart2Buffer[0] != '$') || (rxNum < 10) ) return 0;
+  
+  for(U16 i = 1; i < rxNum; i++)
+  {
+    if( Uart2Buffer[i] == 0x0d )                                 return ( i > 8 ? i : 0);
+    if( (Uart2Buffer[i] < 0x21) || (Uart2Buffer[i] > 0x7A) )     return 0;
+  }
+  return 0;
+}
+
+// ....
+U16 EKSIS_ASCII( void )
+{
+  U32     hiaddr, addr, command, i, tx_num;
+  U8      chksum;
+  
+  addr = hex_to_int(1, Uart2Buffer);
+  if( (addr != NetAddress) && (addr != 0xffff)  )  return 0;
+  
+  command         =  Uart2Buffer[5] * 256 + Uart2Buffer[6];
+  addr            =  hex_to_int(7, Uart2Buffer);  
+  hiaddr          =  hex_to_int(13, Uart2Buffer);
+  tx_num          =  hex_to_char(11, Uart2Buffer);  
+  Uart2Buffer[0]  =  '!';
+    
+  switch(command)
+  {      
+     case 'BS':   OS_Use( &SemaRAM);
+                    system_flags.start_boot= 1;
+                      OS_Unuse( &SemaRAM);
+                  set_mark_forbooter(1);
+                  tx_num = 7;
+                  goto final;
+          
+     case 'WI':   if((tx_num > MAX_DATA_LEN_UART2) || ((addr + tx_num) >  CONFIGSIZE))   goto fail;
+                  OS_Use( &SemaRAM);
+                    hexbuffer_2_binbuffer(Uart2Buffer,(pInt8U)(ConfigBeginAddr + addr), tx_num, 13);
+                    if( (addr == CONFIG_ROM_ADR(&ConfigWord)) ||  (addr == (CONFIG_ROM_ADR(&ConfigWord)) + 3) )
+                    {
+                      system_flags.reiniuart2 = 1;
+                      
+                      if(ConfigWord & RESTART_STATISTIC)
+                      {
+                        ConfigWord    &= ~(RESTART_STATISTIC + STATISCTIC_OVERFLOW);
+                        WriteStatAddr  =  SD_STATISTIC_OFFSET;
+                      }
+                    }
+                    errors_flags.config_memory_fail= errors_flags.config_memory_fail || write_spimem(addr, (pInt8U)(ConfigBeginAddr + addr), tx_num); 
+                  OS_Unuse( &SemaRAM);
+                  tx_num = 7; 
+                  goto final;
+                  
+     case 'WR':   if( (tx_num > MAX_DATA_LEN_UART2) || ((addr+tx_num) > RAMSIZE) ) goto fail;
+                  OS_Use( &SemaRAM);
+                    hexbuffer_2_binbuffer(Uart2Buffer,(pInt8U)(RamBeginAddr + addr), tx_num, 13);
+                    if( (RamBeginAddr + addr) == (U32)&Time )  // установить RTC
+                    {
+                      PWR_CR_bit.DBP=       1;
+                      while(!RTC_CRL_bit.RTOFF);
+                      RTC_CRL_bit.CNF=      1;
+                      RTC_CNTL=             (U32)Time & 0xffff;
+                      RTC_CNTH=             (U32)Time >> 16;
+                      RTC_CRL_bit.CNF=      0;
+                      while(!RTC_CRL_bit.RTOFF);
+                      PWR_CR_bit.DBP=       0;
+                    }
+                  OS_Unuse( &SemaRAM);
+                  tx_num = 7;
+                  goto final;
+
+     case 'RR':   if( (tx_num > MAX_DATA_LEN_UART2) || ((addr + tx_num) >  RAMSIZE) ) goto fail;
+                  OS_Use( &SemaRAM);
+                    binbuffer_2_hexbuffer(Uart2Buffer,(pInt8U)(RamBeginAddr + addr), tx_num, 7);
+                  OS_Unuse( &SemaRAM);
+                  tx_num = 7 + tx_num * 2;
+                  goto final;
+                  
+     case 'RI':   if((tx_num > MAX_DATA_LEN_UART2) || ((addr + tx_num) >  SPIMEMSIZE)) goto fail;
+                  OS_Use( &SemaRAM);
+                      errors_flags.config_memory_fail= errors_flags.config_memory_fail || read_spimem( addr, RSPISD_POINTER, tx_num);
+                  OS_Unuse( &SemaRAM);
+                  binbuffer_2_hexbuffer(Uart2Buffer, RSPISD_POINTER, tx_num, 7); 
+                  tx_num=  7 + tx_num * 2;
+                  goto final;
+                  
+     case 'RF':   if(tx_num > MAX_DATA_LEN_UART2) goto fail;                  
+                  addr  += (hiaddr << 16);
+                  if( (addr + tx_num) > SD_CARD_SIZE ) goto fail;
+                  OS_Use( &SemaRAM);
+                      errors_flags.sd_fail= errors_flags.sd_fail || read_SDCard( RSPISD_POINTER, addr, tx_num);
+                  OS_Unuse( &SemaRAM);
+                  binbuffer_2_hexbuffer(Uart2Buffer, RSPISD_POINTER, tx_num, 7); 
+                  tx_num= tx_num*2 + 7; 
+                  goto final;
+
+     case 'IR':   tx_num= 7;
+                  for(i=0;i<8;i++,tx_num++)        Uart2Buffer[tx_num]= SerialNumber[i];
+                  Uart2Buffer[tx_num++]= ' ';
+                  for(i=0;Version[i];i++,tx_num++) Uart2Buffer[tx_num]= Version[i];
+                  Uart2Buffer[tx_num++]= ' ';
+                  for(i=0;DeviceName[i];i++,tx_num++)      Uart2Buffer[tx_num]= DeviceName[i];
+                  Uart2Buffer[tx_num++]= ' ';
+                  goto final;
+                  
+    case 'CR':    tx_num = 7;
+                  binbuffer_2_hexbuffer(Uart2Buffer, (pU8)&IDWordLo, sizeof(IDWordLo), tx_num);                  
+                  tx_num += sizeof(IDWordLo) * 2;
+                  binbuffer_2_hexbuffer(Uart2Buffer, (pU8)&IDWordHi, sizeof(IDWordHi), tx_num);                  
+                  tx_num += sizeof(IDWordHi) * 2;
+                  goto final;
+                  
+    case 'TS':    tx_num= 7;
+                  OS_Use( &SemaRAM);
+                    system_flags.set_retrans= 1;
+                      OS_Unuse( &SemaRAM);
+                  SetComInputLine(hex_to_char(7,Uart2Buffer)); 
+                  goto final;
+                  
+    case 'TC':    tx_num= 7;
+                  OS_Use( &SemaRAM);
+                    system_flags.set_retrans= 0;
+                      OS_Unuse( &SemaRAM);
+                  goto final;                  
+                  
+    case 'DW':    OS_Use( &SemaRAM);
+                    system_flags.writedefaultmem= 1;
+                      OS_Unuse( &SemaRAM);
+                  tx_num= 7;
+                  goto final;
+
+    case 'DR':    OS_Use( &SemaRAM);
+                    system_flags.readdefaultmem= 1;
+                      OS_Unuse( &SemaRAM);
+                  tx_num= 7;
+                  goto final;
+                  
+    case 'RS':    OS_Use( &SemaRAM);
+                  system_flags.redraw_gui = 1;
+                  OS_Unuse( &SemaRAM);
+                  tx_num = 7;
+                  goto final;
+                  
+    case 'CT':    OS_Use( &SemaRAM);
+                    system_flags.ScreenCalib = 1;
+                      OS_Unuse( &SemaRAM);
+                  tx_num = 7;
+                  goto final;                  
+                  
+    default:
+fail:             Uart2Buffer[0]  =   '?';
+                  tx_num =     7;
+final:
+                  chksum = check_sum8(Uart2Buffer, tx_num);
+                  binbuffer_2_hexbuffer(Uart2Buffer, &chksum, 1, tx_num);
+                  tx_num               += 2;
+                  Uart2Buffer[tx_num++] = 0x0d;                                        
+    }
+  return tx_num;
+}

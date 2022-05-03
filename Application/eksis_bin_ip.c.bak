@@ -1,0 +1,189 @@
+#include "defines.h"
+#include "IP_init.h"
+
+#define TCP_ASK                   0x00
+#define TCP_CMDERR                0x01
+#define TCP_NAK                   0xFF
+#define PAYLOADANS_LEN            4
+
+#define TCP_WDATA_POINTER         &buffer[8]
+#define TCP_RDATA_POINTER         &buffer[4]
+#define ASK_TCPANS                buffer[0]
+#define TCP_DATA_NUM              *((pU16)&buffer[2])
+
+// EKSIS - forever
+U16 EKSIS_TCP(pU8 buffer)
+{
+  U8            command;
+  U16           bytenum;
+  U32           addr;  
+  int           response;
+  
+  addr          = *((pU32)&buffer[0]);
+  bytenum       = *((pU16)&buffer[4]);
+  command       = *((pU16)&buffer[6]);
+    
+  switch(command)
+  {
+  // WR 
+  case WR_USB:  if( (bytenum > UDP_DATA_MAXLEN) || ((addr + bytenum) > RAMSIZE) ) goto fail;
+  
+                  OS_Use( &SemaRAM);
+                  binbuffer_2_binbuffer( TCP_WDATA_POINTER, (pU8)(RamBeginAddr + addr), bytenum);
+                  if( (RamBeginAddr + addr) == (U32)&Time )  // установить RTC
+                  {
+                    PWR_CR_bit.DBP=       1;
+                    while(!RTC_CRL_bit.RTOFF);
+                    RTC_CRL_bit.CNF=      1;
+                    RTC_CNTL=             (U32)Time & 0xffff;
+                    RTC_CNTH=             (U32)Time >> 16;
+                    RTC_CRL_bit.CNF=      0;
+                    while(!RTC_CRL_bit.RTOFF);
+                    PWR_CR_bit.DBP=       0;
+                  }
+                  OS_Unuse( &SemaRAM);
+                  ASK_TCPANS   =  TCP_ASK;
+                  TCP_DATA_NUM =  PAYLOADANS_LEN;
+                  break;
+  // WF                  
+  case WF_USB:  if(bytenum > UDP_DATA_MAXLEN) goto fail;
+                if( addr + bytenum > SD_CARD_SIZE ) goto fail;
+                
+                response = write_SDCard( TCP_WDATA_POINTER, addr, bytenum);
+                OS_Use( &SemaRAM);
+                  errors_flags.sd_fail= errors_flags.sd_fail || response;
+                OS_Unuse( &SemaRAM);
+                ASK_TCPANS   = response ? TCP_CMDERR : TCP_ASK;
+                TCP_DATA_NUM = PAYLOADANS_LEN;
+                break;
+  // WI 
+  case WI_USB:  if( (bytenum > UDP_DATA_MAXLEN) || ((addr + bytenum) > CONFIGSIZE) )  goto fail;
+  
+                OS_Use( &SemaRAM);
+                binbuffer_2_binbuffer( TCP_WDATA_POINTER, (pInt8U)(ConfigBeginAddr + addr), bytenum);
+                if( (addr == CONFIG_ROM_ADR(&ConfigWord)) ||  (addr == (CONFIG_ROM_ADR(&ConfigWord)) + 3) )
+                {
+                  // немедленно перенастраиваем UART-ы
+                  USART2_BRR = select_speed( ConfigWord & UART_MASK, APB1);
+                          
+                  if(ConfigWord & RESTART_STATISTIC)
+                  {
+                    ConfigWord&=    ~(RESTART_STATISTIC + STATISCTIC_OVERFLOW);
+                    WriteStatAddr=  SD_STATISTIC_OFFSET;
+                  }
+                }
+
+                 response = write_spimem( addr, TCP_WDATA_POINTER, bytenum);
+                 errors_flags.config_memory_fail= errors_flags.config_memory_fail || response;
+                OS_Unuse( &SemaRAM);
+
+                ASK_TCPANS   = response ? TCP_CMDERR : TCP_ASK;
+                TCP_DATA_NUM = PAYLOADANS_LEN;
+                break;
+  // RR
+  case RR_USB:  if( (bytenum > UDP_DATA_MAXLEN) || ((addr + bytenum) > RAMSIZE) )  goto fail;
+  
+                OS_Use( &SemaRAM);
+                  binbuffer_2_binbuffer( (pInt8U)(RamBeginAddr + addr), TCP_RDATA_POINTER, bytenum);  
+                OS_Unuse( &SemaRAM);
+                
+                ASK_TCPANS   = TCP_ASK;                
+                TCP_DATA_NUM = PAYLOADANS_LEN + bytenum;
+                break;
+  // RF
+  case RF_USB:  if(bytenum > UDP_DATA_MAXLEN) goto fail;
+                if( addr + bytenum > SD_CARD_SIZE ) goto fail;
+                
+                OS_Use( &SemaRAM);
+                  response             = read_SDCard( TCP_RDATA_POINTER, addr, bytenum);
+                  errors_flags.sd_fail = errors_flags.sd_fail || response;
+                OS_Unuse( &SemaRAM);
+                
+                ASK_TCPANS   = response ? TCP_CMDERR : TCP_ASK;
+                TCP_DATA_NUM = PAYLOADANS_LEN + bytenum;
+                break;
+  // RI         
+  case RI_USB:  if( (bytenum > UDP_DATA_MAXLEN) || ((addr + bytenum) > SPIMEMSIZE) )  goto fail;                
+  
+                OS_Use( &SemaRAM);
+                 response= read_spimem( addr, TCP_RDATA_POINTER, bytenum);
+                 errors_flags.config_memory_fail= errors_flags.config_memory_fail || response;
+                OS_Unuse( &SemaRAM);
+                
+                ASK_TCPANS   = response ? TCP_CMDERR : TCP_ASK;
+                TCP_DATA_NUM = PAYLOADANS_LEN + bytenum;
+                break;   
+
+  // IR
+  case IR_USB:  bytenum = 8; 
+                addr = htonl(IP_GetIPAddr(0));               
+                strcpy( (void *) &buffer[bytenum], (void *)SerialNumber); bytenum += strlen(SerialNumber) + 1;
+                strcpy( (void *) &buffer[bytenum], (void *)Version);      bytenum += strlen(Version) + 1;
+                strcpy( (void *) &buffer[bytenum], (void *)DeviceName);   bytenum += strlen(DeviceName) + 1;
+                memcpy((void*)   &buffer[bytenum], (void*)&addr, 4);      bytenum += 4;
+                *(pU16)TCP_RDATA_POINTER = bytenum - 8;
+                ASK_TCPANS   = TCP_ASK;
+                TCP_DATA_NUM = PAYLOADANS_LEN + bytenum;
+                break;
+                
+  // CR
+  case CR_USB:  bytenum = 8; 
+                memcpy( (pU8)&buffer[bytenum], (pU8)&IDWordLo, sizeof(IDWordLo) ); bytenum += sizeof(IDWordLo);
+                memcpy( (pU8)&buffer[bytenum], (pU8)&IDWordHi, sizeof(IDWordHi) ); bytenum += sizeof(IDWordHi);
+                *(pU16)TCP_RDATA_POINTER = bytenum - 8;
+                ASK_TCPANS   = TCP_ASK;
+                TCP_DATA_NUM = PAYLOADANS_LEN + bytenum;
+                break;                
+                        
+  // CT
+  case CT_USB: OS_Use( &SemaRAM);
+                system_flags.ScreenCalib = 1;
+               OS_Unuse( &SemaRAM);
+               
+               ASK_TCPANS = TCP_ASK;
+               TCP_DATA_NUM = PAYLOADANS_LEN;
+               break;       
+               
+  // Перерисовать экран
+  case RS_USB: OS_Use( &SemaRAM);
+                system_flags.redraw_gui = 1;
+               OS_Unuse( &SemaRAM);
+               
+               ASK_TCPANS   = TCP_ASK;
+               TCP_DATA_NUM = PAYLOADANS_LEN;
+               break;    
+             
+  //копировать текущую конфигурацию в конф. по умолчанию
+  case DW_USB: OS_Use( &SemaRAM);
+                system_flags.writedefaultmem= 1;
+               OS_Unuse( &SemaRAM);
+
+               ASK_TCPANS   = TCP_ASK;
+               TCP_DATA_NUM = PAYLOADANS_LEN;               
+               break;
+      
+  // копировать конф. по умолчанию в текущую конфигурацию                
+  case DR_USB: ASK_TCPANS = TCP_ASK;
+               TCP_DATA_NUM = PAYLOADANS_LEN;
+               
+               OS_Use( &SemaRAM);
+                system_flags.readdefaultmem= 1;
+               OS_Unuse( &SemaRAM);
+               break;     
+               
+     /* снять скриншот */
+     case SS_USB: ASK_TCPANS = TCP_ASK;
+                  TCP_DATA_NUM = PAYLOADANS_LEN;
+                  
+                  OS_Use( &SemaRAM);
+                    system_flags.ScreenShoot = 1;
+                  OS_Unuse( &SemaRAM);
+                  break;  
+             
+    fail:
+    default:     ASK_TCPANS   = TCP_NAK;
+                 TCP_DATA_NUM = PAYLOADANS_LEN;
+  }
+  
+  return TCP_DATA_NUM;
+}
